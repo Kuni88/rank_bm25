@@ -3,7 +3,7 @@
 import math
 import numpy as np
 from multiprocessing import Pool, cpu_count
-
+from scipy.sparse import csr_matrix
 """
 All of these algorithms have been taken from the paper:
 Trotmam et al, Improvements to BM25 and Language Models Examined
@@ -16,39 +16,39 @@ class BM25:
     def __init__(self, corpus, tokenizer=None):
         self.corpus_size = len(corpus)
         self.avgdl = 0
-        self.doc_freqs = []
-        self.idf = {}
         self.doc_len = []
         self.tokenizer = tokenizer
-
         if tokenizer:
             corpus = self._tokenize_corpus(corpus)
 
         nd = self._initialize(corpus)
-        self._calc_idf(nd)
+        idf = self._calc_idf(nd)
+        self._calc_scores(nd, idf)
 
     def _initialize(self, corpus):
-        nd = {}  # word -> number of documents with word
+        self.vocabulary = {}
         num_doc = 0
-        for document in corpus:
-            self.doc_len.append(len(document))
+        # storing word frequencies in corpus
+        data, row, column = [], [], []
+        for doc_id, document in enumerate(corpus):
             num_doc += len(document)
+            self.doc_len.append(len(document))
 
-            frequencies = {}
+            freqs = {}
             for word in document:
-                if word not in frequencies:
-                    frequencies[word] = 0
-                frequencies[word] += 1
-            self.doc_freqs.append(frequencies)
+                if word not in self.vocabulary:
+                    index = len(self.vocabulary)
+                    self.vocabulary[word] = index
+                freqs.setdefault(self.vocabulary[word], 0)
+                freqs[self.vocabulary[word]] += 1
 
-            for word, freq in frequencies.items():
-                try:
-                    nd[word]+=1
-                except KeyError:
-                    nd[word] = 1
-
+            for index, freq in freqs.items():
+                row.append(doc_id)
+                column.append(index)
+                data.append(freq)
+                
         self.avgdl = num_doc / self.corpus_size
-        return nd
+        return csr_matrix((data, (row, column)))
 
     def _tokenize_corpus(self, corpus):
         pool = Pool(cpu_count())
@@ -58,6 +58,9 @@ class BM25:
     def _calc_idf(self, nd):
         raise NotImplementedError()
 
+    def _calc_scores(self, nd, idf):
+        raise NotImplementedError()
+
     def get_scores(self, query):
         raise NotImplementedError()
 
@@ -65,9 +68,8 @@ class BM25:
         raise NotImplementedError()
 
     def get_top_n(self, query, documents, n=5):
-
         assert self.corpus_size == len(documents), "The documents given don't match the index corpus!"
-
+        
         scores = self.get_scores(query)
         top_n = np.argsort(scores)[::-1][:n]
         return [documents[i] for i in top_n]
@@ -81,26 +83,33 @@ class BM25Okapi(BM25):
         super().__init__(corpus, tokenizer)
 
     def _calc_idf(self, nd):
-        """
-        Calculates frequencies of terms in documents and in corpus.
-        This algorithm sets a floor on the idf values to eps * average_idf
-        """
-        # collect idf sum to calculate an average idf for epsilon value
         idf_sum = 0
-        # collect words with negative idf to set them a special epsilon value.
-        # idf can be negative if word is contained in more than half of documents
-        negative_idfs = []
-        for word, freq in nd.items():
-            idf = math.log(self.corpus_size - freq + 0.5) - math.log(freq + 0.5)
-            self.idf[word] = idf
-            idf_sum += idf
-            if idf < 0:
-                negative_idfs.append(word)
-        self.average_idf = idf_sum / len(self.idf)
+        idf = np.zeros(nd.shape)
+        for index in range(nd.shape[1]):
+            ndi = nd[:, index].toarray()
+            idf[:, index] = (np.log(self.corpus_size - ndi + 0.5) - np.log(ndi + 0.5)).T
 
+        self.average_idf = np.sum(idf) / nd.shape[1]
         eps = self.epsilon * self.average_idf
-        for word in negative_idfs:
-            self.idf[word] = eps
+        idf[idf < 0] = eps
+        return idf
+
+    def _calc_scores(self, nd, idf):
+        self.scores = np.zeros(nd.shape)
+        base = 1 - self.b + self.b * np.array(self.doc_len) / self.avgdl
+        for i in range(len(self.vocabulary)):
+            freq = nd[:, i].toarray().T
+            self.scores[:, i] = idf[:, i] * freq * (self.k1 + 1) / (freq + self.k1 * base)
+
+    def get_scores(self, query):
+        score = np.zeros(self.corpus_size)
+        doc_len = np.array(self.doc_len)
+
+        for q in query:
+            if q in self.vocabulary:
+                index = self.vocabulary[q]
+                score += self.scores[:, index]
+        return score
 
     def get_scores(self, query):
         """
